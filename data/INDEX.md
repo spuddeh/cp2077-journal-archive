@@ -31,7 +31,7 @@ SELECT id, kind, title FROM search
 SELECT title, text FROM entries WHERE kind='sms' AND contact='Judy Alvarez';
 
 -- one entry, full structure
-SELECT data FROM entries WHERE id='codex/glossary/...';
+SELECT data FROM entries WHERE id='codex/glossary/world/blackwall';
 ```
 
 ## Contacts by thread count

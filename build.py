@@ -518,6 +518,14 @@ def write_sqlite(records, path):
     db.close()
 
 
+def sample_id(records):
+    """A real id for the worked example, so the index never ships a placeholder."""
+    for r in records:
+        if r["kind"] == "codex" and r.get("title") == "The Blackwall":
+            return r["id"]
+    return records[0]["id"] if records else ""
+
+
 def write_index(records, by_kind, path, loc_counts):
     total_words = sum(len((r.get("text") or "").split()) for r in records)
     lines = [
@@ -562,7 +570,7 @@ def write_index(records, by_kind, path, loc_counts):
         "SELECT title, text FROM entries WHERE kind='sms' AND contact='Judy Alvarez';",
         "",
         "-- one entry, full structure",
-        "SELECT data FROM entries WHERE id='codex/glossary/...';",
+        f"SELECT data FROM entries WHERE id='{sample_id(records)}';",
         "```",
         "",
         "## Contacts by thread count",

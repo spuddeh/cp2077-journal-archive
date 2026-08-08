@@ -657,6 +657,7 @@ def write_sqlite(records, path):
             speaker       TEXT,
             speaker_key   TEXT,
             addressee     TEXT,
+            addressee_key TEXT,
             data          TEXT NOT NULL
         );
         CREATE INDEX idx_kind    ON entries(kind);
@@ -664,6 +665,7 @@ def write_sqlite(records, path):
         CREATE INDEX idx_cat     ON entries(category);
         CREATE INDEX idx_scene   ON entries(scene, line);
         CREATE INDEX idx_speaker ON entries(speaker_key);
+        CREATE INDEX idx_addr    ON entries(addressee_key);
         CREATE VIRTUAL TABLE search USING fts5(
             id UNINDEXED, kind UNINDEXED, title, text,
             tokenize = "unicode61 remove_diacritics 2"
@@ -676,11 +678,11 @@ def write_sqlite(records, path):
             "/".join(r.get("path") or []), r.get("title", ""), r.get("text", ""),
             r.get("contact", ""), r.get("category", ""), r.get("quest_type", ""),
             r.get("address", ""), r.get("scene", ""), r.get("line"),
-            r.get("speaker", ""), r.get("speaker_key", ""), r.get("addressee", ""),
+            r.get("speaker", ""), r.get("speaker_key", ""), r.get("addressee", ""), r.get("addressee_key", ""),
             json.dumps(r, ensure_ascii=False),
         ))
         search_rows.append((r["id"], r["kind"], r.get("title", ""), r.get("text", "")))
-    db.executemany("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    db.executemany("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     db.executemany("INSERT INTO search VALUES (?,?,?,?)", search_rows)
     db.commit()
     db.execute("VACUUM")

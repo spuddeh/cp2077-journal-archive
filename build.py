@@ -431,6 +431,93 @@ class Builder:
         })
 
 
+# --------------------------------------------------------------------------
+# Spoken dialogue
+# --------------------------------------------------------------------------
+
+# Two inline tags wrap foreign speech, and they mean opposite things.
+#   <kiroshi      l="mex" o="Salud, amiga." t="Cheers, friend." b="" a=""/>
+#   <mothertongue l="mex" m="Fuera, chica"                     b="" a=". Get her outside!"/>
+# A Kiroshi implant translates, so `t` is what the player reads and `o` is what is
+# actually spoken. Mothertongue has no `t` at all - the line stays untranslated on
+# screen by design, and `m` is what is shown.
+TAG = re.compile(r"<\s*(kiroshi|mothertongue)\b([^>]*?)/?\s*>", re.IGNORECASE)
+ATTR = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
+
+
+def render_line(value):
+    """Resolve the inline tags to what the player reads, and report the spoken original."""
+    if not value:
+        return "", None
+    spoken = []
+
+    def replace(m):
+        tag = m.group(1).lower()
+        attrs = dict(ATTR.findall(m.group(2)))
+        before, after = attrs.get("b", ""), attrs.get("a", "")
+        if tag == "kiroshi":
+            shown = attrs.get("t", "")
+            if attrs.get("o"):
+                spoken.append(attrs["o"])
+        else:
+            shown = attrs.get("m", "")
+        return f"{before}{shown}{after}"
+
+    text = TAG.sub(replace, value).strip()
+    return unescape(text), (" / ".join(spoken) if spoken else None)
+
+
+def build_subtitles(path):
+    """One record per line, not per scene.
+
+    A scene file runs to hundreds of lines, so a scene-level record would answer
+    "which conversation mentions this" when the question is "which line".
+    """
+    records = []
+    prefix = re.compile(r"^(base|ep1)\\localization\\en-us\\subtitles\\", re.IGNORECASE)
+    per_scene = {}
+    with open(path, encoding="utf-8") as f:
+        for raw_line in f:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            row = json.loads(raw_line)
+            game_path = row["p"]
+            source = game_path.split("\\", 1)[0].lower()
+            scene = prefix.sub("", game_path).removesuffix(".json").replace("\\", "/")
+            index = per_scene.get(scene, 0)
+            per_scene[scene] = index + 1
+
+            text, spoken = render_line(row.get("f"))
+            male, _ = render_line(row.get("m"))
+            if not text and not male:
+                continue
+            if not text:
+                text, male = male, ""
+
+            rec = {
+                "id": f"subtitle/{scene}/{row['s']}",
+                "kind": "subtitle",
+                "source": source,
+                "node_type": "localizationPersistenceSubtitleEntry",
+                "journal_id": str(row["s"]),
+                "path": scene.split("/")[:-1],
+                "scene": scene,
+                "category": scene.split("/")[0],
+                "line": index,
+                "string_id": str(row["s"]),
+                "title": scene.rsplit("/", 1)[-1],
+                "text": text,
+            }
+            # V is voiced twice, and ~5% of lines differ by the player's gender.
+            if male and male != text:
+                rec["text_male"] = male
+            if spoken:
+                rec["spoken_original"] = spoken
+            records.append(rec)
+    return records
+
+
 def render_thread(contact, thread):
     """Flatten a conversation into readable text so full-text search hits it."""
     lines = []
@@ -492,11 +579,14 @@ def write_sqlite(records, path):
             category      TEXT,
             quest_type    TEXT,
             address       TEXT,
+            scene         TEXT,
+            line          INTEGER,
             data          TEXT NOT NULL
         );
         CREATE INDEX idx_kind    ON entries(kind);
         CREATE INDEX idx_contact ON entries(contact);
         CREATE INDEX idx_cat     ON entries(category);
+        CREATE INDEX idx_scene   ON entries(scene, line);
         CREATE VIRTUAL TABLE search USING fts5(
             id UNINDEXED, kind UNINDEXED, title, text,
             tokenize = "unicode61 remove_diacritics 2"
@@ -508,10 +598,11 @@ def write_sqlite(records, path):
             r["id"], r["kind"], r["source"], r.get("journal_id", ""),
             "/".join(r.get("path") or []), r.get("title", ""), r.get("text", ""),
             r.get("contact", ""), r.get("category", ""), r.get("quest_type", ""),
-            r.get("address", ""), json.dumps(r, ensure_ascii=False),
+            r.get("address", ""), r.get("scene", ""), r.get("line"),
+            json.dumps(r, ensure_ascii=False),
         ))
         search_rows.append((r["id"], r["kind"], r.get("title", ""), r.get("text", "")))
-    db.executemany("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    db.executemany("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     db.executemany("INSERT INTO search VALUES (?,?,?,?)", search_rows)
     db.commit()
     db.execute("VACUUM")
@@ -552,6 +643,7 @@ def write_index(records, by_kind, path, loc_counts):
         "internet": "Pages of the in-game internet",
         "quest": "Quest log: description, phases and objectives",
         "tarot": "Tarot card readings",
+        "subtitle": "Spoken dialogue, one record per line, tagged by scene",
     }
     for kind in sorted(by_kind, key=lambda k: -len(by_kind[k])):
         lines.append(
@@ -636,6 +728,17 @@ def main():
         print(f"{source}: {len(builder.records) - before:,} entries")
 
     records = builder.records
+
+    # Spoken dialogue comes from 3,800 separate subtitle resources rather than the journal,
+    # so it is swept out by a wscript (see README) instead of read here.
+    subs = os.path.join(args.raw, "subtitles_en_us.jsonl")
+    if os.path.exists(subs):
+        lines = build_subtitles(subs)
+        records.extend(lines)
+        print(f"subtitles: {len(lines):,} lines")
+    else:
+        print(f"subtitles: skipped, no {subs}")
+
     by_kind = {}
     for r in records:
         by_kind.setdefault(r["kind"], []).append(r)

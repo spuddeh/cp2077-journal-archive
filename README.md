@@ -1,14 +1,15 @@
-# Cyberpunk 2077 journal archive
+# Cyberpunk 2077 text archive
 
-Every readable entry in the game's journal resource - shards, phone conversations, codex
-entries, computer mail and files, the in-game internet, the quest log and the tarot
-readings - resolved against the en-us string table and written as JSONL plus a SQLite
-database with a full-text index.
+Every word of text in the game: the journal resource - shards, phone conversations, codex
+entries, computer mail and files, the in-game internet, the quest log, the tarot readings -
+plus every line of spoken dialogue. Resolved against the en-us string tables and written as
+JSONL plus a SQLite database with a full-text index.
 
 Built for querying, not for browsing. One `SELECT` replaces reading thousands of files.
 
 | Kind | Entries | What it is |
 | --- | --- | --- |
+| `subtitle` | 104,895 | Spoken dialogue, one record per line |
 | `shard` | 1,804 | Shards and journal entries the player picks up |
 | `mail` | 733 | Emails on computers and terminals |
 | `internet` | 678 | Pages of the in-game internet |
@@ -33,6 +34,9 @@ SELECT id, kind, title FROM search
 
 -- every thread with one contact
 SELECT title, text FROM entries WHERE kind = 'sms' AND contact = 'Judy Alvarez';
+
+-- a whole scene back in order, once a search has found one line of it
+SELECT line, text FROM entries WHERE scene = 'quest/q101/q101_01_meeting_dex' ORDER BY line;
 
 -- one entry with its full structure
 SELECT data FROM entries WHERE id = 'codex/glossary/world/blackwall';
@@ -65,13 +69,27 @@ Kind-specific fields include `contact` and `messages` on `sms`, `sender` and `ad
 on `mail`, `address` and `blocks` on `internet`, and `phases` with nested `objectives`
 on `quest`.
 
+`subtitle` records carry `scene` and `line` instead of `lockeys` - a subtitle is keyed by a
+64-bit `string_id`, not a LocKey, and lives in a per-scene resource. Two more appear when
+the source line needs them:
+
+- `text_male` - V is voiced twice and about 5% of lines differ by the player's gender, so
+  `text` is the feminine reading and `text_male` the masculine one.
+- `spoken_original` - the untranslated foreign line, when `text` is what a Kiroshi implant
+  renders. `<kiroshi>` carries a translation and `<mothertongue>` deliberately does not, so
+  a mothertongue line stays in its own language in `text`, exactly as the player sees it.
+
 ## Limits
+
+**A subtitle does not name its speaker.** The resource holds text and a string id, nothing
+else; the scene path is the only attribution there is. Naming speakers means reading the
+`.scene` files, which this does not do.
 
 **Conversation order is authored order, not chronological order.** The journal stores a
 thread's messages and choice groups in the order the writers laid them out in the editor.
 The runtime picks a path through them from quest facts, so a reply can appear in the file
 before the message it answers. Reconstructing true chronology needs the quest graph, which
-this does not read.
+this does not read. Subtitle `line` numbers are within-file order and carry the same caveat.
 
 **English only.** The other 18 languages are the same journal against a different
 `onscreens` file; the build takes a language by swapping two input paths.
@@ -93,6 +111,12 @@ with `maleVariant` empty; the build falls back to `maleVariant` when the first i
 
 All four go through `convert_to_json` - the localization files are cooked CR2W despite
 the `.json` extension, so extracting them raw yields binary.
+
+Spoken dialogue is a fifth input, `raw/subtitles_en_us.jsonl`, and it is not four files but
+3,800 - one subtitle resource per scene. Sweeping them one call at a time is not viable, so
+`sweep_subtitles.wscript` does the whole set inside WolvenKit in about eight seconds. Run it
+through the MCP's `run_wscript` and copy its output into `raw/`. The build skips subtitles
+and says so if that file is absent.
 
 ```bash
 python build.py               # full rebuild

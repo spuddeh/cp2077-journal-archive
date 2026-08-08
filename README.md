@@ -79,11 +79,39 @@ the source line needs them:
   renders. `<kiroshi>` carries a translation and `<mothertongue>` deliberately does not, so
   a mothertongue line stays in its own language in `text`, exactly as the player sees it.
 
+Spoken lines also carry `speaker`, `addressee` and `speaker_key`, which come from the
+`.scene` files rather than the subtitle resource - see below. `is_choice` marks V's
+dialogue options, which are a separate list in the screenplay and have no speaker of their
+own.
+
+## Who says a line
+
+A subtitle resource names no speaker. A `.scene` does: every `scnscreenplayDialogLine`
+carries the subtitle's own id in `locstringId.ruid`, alongside `speaker` and `addressee`
+actor ids that resolve against that scene's `actors` list. Sweeping all 8,553 scenes
+attributes **104,798 of 104,895 lines**, and gives who each line is aimed at for free.
+
+```sql
+-- everything one character says
+SELECT scene, text FROM entries WHERE speaker_key = 'judy';
+
+-- who talks to whom, most first
+SELECT speaker_key, addressee_key, count(*) c FROM entries
+  WHERE kind = 'subtitle' AND addressee_key <> '' GROUP BY 1, 2 ORDER BY c DESC LIMIT 20;
+```
+
+**Group on `speaker_key`, not `speaker`.** Scenes author the same character inconsistently -
+`Johnny` and `johnny`, `Panam` and `panam` - so the authored name splits one character
+across rows. `speaker` keeps the value as written; `speaker_key` is the lowercased,
+space-normalised form to group on. There are 3,403 distinct speakers.
+
 ## Limits
 
-**A subtitle does not name its speaker.** The resource holds text and a string id, nothing
-else; the scene path is the only attribution there is. Naming speakers means reading the
-`.scene` files, which this does not do.
+**Prop ids are a separate id space from actor ids.** Folding `props` into the actor name
+table lets a prop overwrite an actor of the same number, which attributes hundreds of lines
+to a chair, a cigarette and a coin. The sweep reads `actors` and `playerActors` only.
+
+**97 lines have no speaker.** Their string ids appear in no scene's screenplay.
 
 **Conversation order is authored order, not chronological order.** The journal stores a
 thread's messages and choice groups in the order the writers laid them out in the editor.
@@ -117,6 +145,11 @@ Spoken dialogue is a fifth input, `raw/subtitles_en_us.jsonl`, and it is not fou
 `sweep_subtitles.wscript` does the whole set inside WolvenKit in about eight seconds. Run it
 through the MCP's `run_wscript` and copy its output into `raw/`. The build skips subtitles
 and says so if that file is absent.
+
+Speakers are a sixth input, `raw/speakers*.jsonl`, from `sweep_speakers.wscript` over the
+8,553 `.scene` files. That is roughly 24 GB of JSON to parse, so the script runs in batches -
+`base\quest\`, `base\open_world\`, then everything else - about four minutes in total. The
+build merges every `speakers*.jsonl` in `raw/`, and attributes nothing if none are present.
 
 ```bash
 python build.py               # full rebuild

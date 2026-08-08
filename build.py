@@ -467,12 +467,66 @@ def render_line(value):
     return unescape(text), (" / ".join(spoken) if spoken else None)
 
 
-def build_subtitles(path):
+def load_speakers(raw_dir):
+    """ruid -> who says the line, swept out of the .scene files.
+
+    A subtitle resource names no speaker. The `.scene` files do: a
+    `scnscreenplayDialogLine` carries the same id in `locstringId.ruid` alongside
+    `speaker` and `addressee` actor ids, which resolve against the scene's own
+    `actors` list. `scnscreenplayChoiceOption` entries are V's dialogue options and
+    carry no speaker because they never need one.
+
+    A ruid can appear in more than one scene, so the scene's own basename breaks the
+    tie before anything else is considered.
+    """
+    by_ruid = {}
+    for name in sorted(os.listdir(raw_dir)):
+        if not (name.startswith("speakers") and name.endswith(".jsonl")):
+            continue
+        with open(os.path.join(raw_dir, name), encoding="utf-8") as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                row = json.loads(raw_line)
+                stem = os.path.splitext(os.path.basename(row["p"]))[0].lower()
+                by_ruid.setdefault(row["r"], []).append({
+                    "speaker": row.get("s"),
+                    "addressee": row.get("a"),
+                    "is_choice": bool(row.get("c")),
+                    "stem": stem,
+                })
+    return by_ruid
+
+
+def speaker_key(name):
+    """Group key for an actor name, which scenes author with inconsistent case."""
+    return re.sub(r"[\s_]+", " ", str(name)).strip().lower()
+
+
+def pick_speaker(candidates, scene):
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    stem = scene.rsplit("/", 1)[-1].lower()
+    for c in candidates:
+        if c["stem"] == stem:
+            return c
+    named = [c for c in candidates if c["speaker"]]
+    pool = named or candidates
+    if len({c["speaker"] for c in pool}) == 1:
+        return pool[0]
+    return dict(pool[0], ambiguous=True)
+
+
+def build_subtitles(path, speakers=None):
     """One record per line, not per scene.
 
     A scene file runs to hundreds of lines, so a scene-level record would answer
     "which conversation mentions this" when the question is "which line".
     """
+    speakers = speakers or {}
     records = []
     prefix = re.compile(r"^(base|ep1)\\localization\\en-us\\subtitles\\", re.IGNORECASE)
     per_scene = {}
@@ -514,6 +568,25 @@ def build_subtitles(path):
                 rec["text_male"] = male
             if spoken:
                 rec["spoken_original"] = spoken
+
+            who = pick_speaker(speakers.get(str(row["s"])), scene)
+            if who:
+                if who["is_choice"]:
+                    rec["speaker"] = "V"
+                    rec["is_choice"] = True
+                else:
+                    if who["speaker"]:
+                        rec["speaker"] = who["speaker"]
+                    if who["addressee"]:
+                        rec["addressee"] = who["addressee"]
+                if who.get("ambiguous"):
+                    rec["speaker_ambiguous"] = True
+            # Scenes name the same character inconsistently - Johnny and johnny, Panam and
+            # panam - so grouping on the authored name splits a character across rows.
+            if rec.get("speaker"):
+                rec["speaker_key"] = speaker_key(rec["speaker"])
+            if rec.get("addressee"):
+                rec["addressee_key"] = speaker_key(rec["addressee"])
             records.append(rec)
     return records
 
@@ -581,12 +654,16 @@ def write_sqlite(records, path):
             address       TEXT,
             scene         TEXT,
             line          INTEGER,
+            speaker       TEXT,
+            speaker_key   TEXT,
+            addressee     TEXT,
             data          TEXT NOT NULL
         );
         CREATE INDEX idx_kind    ON entries(kind);
         CREATE INDEX idx_contact ON entries(contact);
         CREATE INDEX idx_cat     ON entries(category);
         CREATE INDEX idx_scene   ON entries(scene, line);
+        CREATE INDEX idx_speaker ON entries(speaker_key);
         CREATE VIRTUAL TABLE search USING fts5(
             id UNINDEXED, kind UNINDEXED, title, text,
             tokenize = "unicode61 remove_diacritics 2"
@@ -599,10 +676,11 @@ def write_sqlite(records, path):
             "/".join(r.get("path") or []), r.get("title", ""), r.get("text", ""),
             r.get("contact", ""), r.get("category", ""), r.get("quest_type", ""),
             r.get("address", ""), r.get("scene", ""), r.get("line"),
+            r.get("speaker", ""), r.get("speaker_key", ""), r.get("addressee", ""),
             json.dumps(r, ensure_ascii=False),
         ))
         search_rows.append((r["id"], r["kind"], r.get("title", ""), r.get("text", "")))
-    db.executemany("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    db.executemany("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     db.executemany("INSERT INTO search VALUES (?,?,?,?)", search_rows)
     db.commit()
     db.execute("VACUUM")
@@ -733,9 +811,14 @@ def main():
     # so it is swept out by a wscript (see README) instead of read here.
     subs = os.path.join(args.raw, "subtitles_en_us.jsonl")
     if os.path.exists(subs):
-        lines = build_subtitles(subs)
+        speakers = load_speakers(args.raw)
+        if speakers:
+            print(f"speakers: {len(speakers):,} ids swept from the .scene files")
+        lines = build_subtitles(subs, speakers)
+        attributed = sum(1 for r in lines if r.get("speaker"))
         records.extend(lines)
-        print(f"subtitles: {len(lines):,} lines")
+        pct = (100 * attributed / len(lines)) if lines else 0
+        print(f"subtitles: {len(lines):,} lines, {attributed:,} with a speaker ({pct:.1f}%)")
     else:
         print(f"subtitles: skipped, no {subs}")
 

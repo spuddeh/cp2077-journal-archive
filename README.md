@@ -36,7 +36,7 @@ SELECT id, kind, title FROM search
 SELECT title, text FROM entries WHERE kind = 'sms' AND contact = 'Judy Alvarez';
 
 -- a whole scene back in order, once a search has found one line of it
-SELECT line, text FROM entries WHERE scene = 'quest/q101/q101_01_meeting_dex' ORDER BY line;
+SELECT line, text FROM entries WHERE scene = 'quest/q101/q101_07_ripperdoc' ORDER BY line;
 
 -- one entry with its full structure
 SELECT data FROM entries WHERE id = 'codex/glossary/world/blackwall';

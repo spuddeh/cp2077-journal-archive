@@ -47,6 +47,9 @@ filter without parsing JSON. The `search` table indexes `title` and `text` only.
 
 The JSONL files carry the same records, one per line, if a stream is easier than a query.
 
+`USAGE.md` is the cookbook: the query shapes that answer real questions, and the traps that
+make a wrong answer look like a right one.
+
 ## What is in a record
 
 Common to every kind:

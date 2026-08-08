@@ -26,7 +26,7 @@ resource, resolved against the en-us string table.
 ```sql
 -- full text, ranked
 SELECT id, kind, title FROM search
-  WHERE search MATCH 'arasaka NEAR/5 tower' ORDER BY rank LIMIT 20;
+  WHERE search MATCH 'NEAR(arasaka tower, 5)' ORDER BY rank LIMIT 20;
 
 -- everything one contact ever texted
 SELECT title, text FROM entries WHERE kind='sms' AND contact='Judy Alvarez';

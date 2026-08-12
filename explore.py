@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -98,21 +99,89 @@ def cell(value) -> str:
     return text
 
 
+# `field:value` in the search box filters on a column of `entries`. The full-text index
+# covers title and text only, so without this a filter reaches FTS5 and comes back as
+# "no such column". A key column is matched on its normalised form, which is the only way
+# to catch a name the scenes authored with inconsistent case.
+FIELDS = {
+    "speaker": ("speaker_key", True),
+    "addressee": ("addressee_key", True),
+    "speaker_key": ("speaker_key", True),
+    "addressee_key": ("addressee_key", True),
+    "kind": ("kind", False),
+    "source": ("source", False),
+    "scene": ("scene", False),
+    "contact": ("contact", False),
+    "category": ("category", False),
+    "quest_type": ("quest_type", False),
+    "address": ("address", False),
+    "id": ("id", False),
+}
+
+FILTER_RE = re.compile(r'(\w+)\s*:\s*("[^"]*"|\'[^\']*\'|\S+)')
+
+
+def parse_filters(term: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split `speaker:johnny blackwall` into ('blackwall', [('speaker_key', 'johnny')])."""
+    found: list[tuple[str, str]] = []
+
+    def take(m: re.Match) -> str:
+        field = m.group(1).lower()
+        if field not in FIELDS:
+            return m.group(0)          # an unknown field stays in the full-text term
+        column, normalise = FIELDS[field]
+        value = m.group(2).strip("\"'")
+        if normalise:
+            value = " ".join(value.lower().split())
+        found.append((column, value))
+        return " "
+
+    rest = FILTER_RE.sub(take, term)
+    return " ".join(rest.split()), found
+
+
 def search(term: str, kind: str, limit: int) -> dict:
-    where = "search MATCH ?"
-    params: list = [term]
+    text, filters = parse_filters(term)
     if kind:
-        where += " AND e.kind = ?"
-        params.append(kind)
-    params.append(limit)
-    sql = f"""
-        SELECT e.id, e.kind, e.source, e.title,
-               snippet(search, 3, '\x02', '\x03', '…', 14) AS match,
-               e.speaker, e.scene
-        FROM search s JOIN entries e ON e.id = s.id
-        WHERE {where} ORDER BY rank LIMIT ?
-    """
-    return run(sql, tuple(params))
+        filters.append(("kind", kind))
+
+    clauses = [f"e.{column} = ?" for column, _ in filters]
+    params: list = [value for _, value in filters]
+
+    if text:
+        # ranked full text, with any filters narrowing it
+        where = " AND ".join(["search MATCH ?"] + clauses)
+        params = [text] + params + [limit]
+        sql = f"""
+            SELECT e.id, e.kind, e.source, e.title,
+                   snippet(search, 3, '\x02', '\x03', '…', 14) AS match,
+                   e.speaker, e.addressee, e.scene
+            FROM search s JOIN entries e ON e.id = s.id
+            WHERE {where} ORDER BY rank LIMIT ?
+        """
+    elif filters:
+        # filters alone: no text to rank on, so read in authored order
+        params = params + [limit]
+        sql = f"""
+            SELECT e.id, e.kind, e.source, e.title, e.text,
+                   e.speaker, e.addressee, e.scene, e.line
+            FROM entries e
+            WHERE {" AND ".join(clauses)}
+            ORDER BY e.scene, e.line, e.id LIMIT ?
+        """
+    else:
+        return {"cols": [], "rows": [], "ms": 0, "truncated": False}
+
+    result = run(sql, tuple(params))
+    error = result.get("error", "")
+    if error.startswith("no such column"):
+        column = error.split(":")[-1].strip()
+        usable = ", ".join(sorted(f for f in FIELDS if not f.endswith("_key")))
+        result["error"] = (
+            f"'{column}:' is not a filter. Full text covers title: and text: only; "
+            f"the fields that filter are {usable}. Anything else, use the SQL tab."
+        )
+    return result
 
 
 def stats() -> dict:
@@ -196,6 +265,11 @@ textarea{width:100%;font-family:var(--mono);font-size:13px;resize:vertical;min-h
 .sqlwrap{padding:10px 16px;border-bottom:1px solid var(--line)}
 .sqlrow{display:flex;gap:8px;margin-top:8px;align-items:center}
 .hint{color:var(--dim);font-size:12px}
+#searchHint{padding-top:0;gap:14px;flex-wrap:wrap}
+#searchHint b{color:var(--fg)}
+.chip{font-family:var(--mono);font-size:12px;color:var(--accent2);background:var(--panel2);
+  border:1px solid var(--line);padding:1px 6px;margin-right:4px;cursor:pointer}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
 #status{padding:6px 16px;font-family:var(--mono);font-size:12px;color:var(--dim);
   border-bottom:1px solid var(--line);min-height:27px}
 #status.err{color:var(--bad)}
@@ -239,12 +313,16 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--panel2);border:1px s
 <main>
 <div id="left">
   <div class="bar" id="searchBar">
-    <input type="search" id="q" placeholder="full-text: blackwall &nbsp;|&nbsp; &quot;night city&quot; &nbsp;|&nbsp; denzel OR cryer &nbsp;|&nbsp; NEAR(arasaka tower, 5)" autofocus>
+    <input type="search" id="q" placeholder="blackwall &nbsp;|&nbsp; &quot;night city&quot; &nbsp;|&nbsp; denzel OR cryer &nbsp;|&nbsp; speaker:johnny addressee:alt &nbsp;|&nbsp; speaker:&quot;maximum mike&quot; radio" autofocus>
     <select id="kind"><option value="">every kind</option></select>
     <select id="limit">
       <option>50</option><option selected>200</option><option>1000</option>
     </select>
     <button class="go" id="goSearch">Search</button>
+  </div>
+  <div class="bar hint" id="searchHint">
+    <span><b>field:value</b> filters, bare words are full text, both together narrow one by the other.</span>
+    <span id="fieldList"></span>
   </div>
 
   <div class="sqlwrap hidden" id="sqlBar">
@@ -331,21 +409,21 @@ async function doSql(sql){
 }
 
 function showSql(sql){
-  $('#tabSql').classList.add('on'); $('#tabSearch').classList.remove('on');
-  $('#sqlBar').classList.remove('hidden'); $('#searchBar').classList.add('hidden');
+  tab('sql');
   doSql(sql);
 }
 
-$('#tabSearch').onclick = () => {
-  $('#tabSearch').classList.add('on'); $('#tabSql').classList.remove('on');
-  $('#searchBar').classList.remove('hidden'); $('#sqlBar').classList.add('hidden');
-  $('#q').focus();
-};
-$('#tabSql').onclick = () => {
-  $('#tabSql').classList.add('on'); $('#tabSearch').classList.remove('on');
-  $('#sqlBar').classList.remove('hidden'); $('#searchBar').classList.add('hidden');
-  $('#sql').focus();
-};
+function tab(which){
+  const searching = which === 'search';
+  $('#tabSearch').classList.toggle('on', searching);
+  $('#tabSql').classList.toggle('on', !searching);
+  $('#searchBar').classList.toggle('hidden', !searching);
+  $('#searchHint').classList.toggle('hidden', !searching);
+  $('#sqlBar').classList.toggle('hidden', searching);
+  $(searching ? '#q' : '#sql').focus();
+}
+$('#tabSearch').onclick = () => tab('search');
+$('#tabSql').onclick = () => tab('sql');
 
 $('#goSearch').onclick = () => doSearch();
 $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
@@ -375,7 +453,17 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') $('#side').classList.remove('open');
 });
 
+$('#fieldList').addEventListener('click', e => {
+  const c = e.target.closest('.chip');
+  if (!c) return;
+  const box = $('#q');
+  box.value = (box.value.trim() + ' ' + c.textContent).trim();
+  box.focus();
+});
+
 (async () => {
+  const f = await (await fetch('/api/fields')).json();
+  $('#fieldList').innerHTML = f.map(x => `<span class="chip">${x}:</span>`).join('');
   const s = await (await fetch('/api/stats')).json();
   $('#counts').textContent = s.total.toLocaleString() + ' entries · ' +
     s.kinds.map(k => `${k.kind} ${k.n.toLocaleString()}`).join('  ');
@@ -417,6 +505,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(stats())
         elif path == "/api/presets":
             self.send_json(PRESETS)
+        elif path == "/api/fields":
+            self.send_json(sorted(f for f in FIELDS if not f.endswith("_key")))
         else:
             self.send_json({"error": "no such path"}, 404)
 

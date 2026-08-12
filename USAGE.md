@@ -3,7 +3,8 @@
 The shapes that answer real questions against `data/journal.db`. Each one is here because it
 came up, not because it completes a matrix.
 
-Run them however is convenient:
+Run them however is convenient. `python explore.py` puts them in a browser - the SQL box takes
+any of these, and the saved-query list carries the ones below. Or from a shell:
 
 ```bash
 python -c "import sqlite3,sys; sys.stdout.reconfigure(encoding='utf-8'); [print(r) for r in sqlite3.connect('data/journal.db').execute('''<QUERY>''')]"

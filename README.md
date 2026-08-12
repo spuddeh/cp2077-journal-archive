@@ -25,7 +25,14 @@ Base game and Phantom Liberty, tagged per entry by `source`.
 
 ```bash
 python build.py --db-only     # data/journal.db, about two seconds
+python explore.py             # query console in the browser, http://127.0.0.1:8777
 ```
+
+`explore.py` is a full-text box, a SQL box and a list of saved queries. An `id` in a result
+opens the whole record, a `scene` reads it back in order, a speaker expands to everything
+that character says. The database is opened read-only and the SQL box takes `SELECT`,
+`WITH` and `EXPLAIN` only, so nothing typed there can damage the archive. Standard library
+only - no install step.
 
 ```sql
 -- full text, ranked

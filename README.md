@@ -189,3 +189,27 @@ published as broken. Both causes are in the journal's shape:
   `gameJournalPhoneChoiceEntry` nodes inside a choice group - a different type entirely.
 
 This build reads the journal from the game rather than reusing that extraction.
+
+## Getting a copy
+
+```bash
+git clone https://github.com/spuddeh/cp2077-journal-archive.git
+cd cp2077-journal-archive
+python build.py --db-only     # data/*.jsonl -> data/journal.db
+python explore.py
+```
+
+Python 3.9 or newer, standard library only. `data/journal.db` is not committed - it is
+rebuilt from the committed JSONL in about two seconds, and `raw/` is not committed either
+because it is 118 MB that derives entirely from a game install.
+
+## What this contains, and whose it is
+
+The text is Cyberpunk 2077's, so it belongs to CD PROJEKT RED. This repository is an
+extraction of it for modding and research - finding a LocKey, checking whether a thing is
+in the lore, reading a scene in order - and it carries no game code, assets or binaries.
+The build and query scripts are the only part that is this repository's own work.
+
+This archive was built with the assistance of an LLM. Every count in this README was run
+against the database rather than estimated. No rogue AIs were permitted through the
+Blackwall.

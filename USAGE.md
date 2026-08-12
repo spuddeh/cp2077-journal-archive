@@ -121,6 +121,28 @@ for p in ['raw/onscreens_base.json', 'raw/onscreens_ep1.json']:
 The `secondaryKey` names the record the string belongs to, which is how a name gets back to
 a TweakDB path.
 
+## 9. The same questions from the console's search box
+
+`python explore.py` takes `field:value` beside the search terms, which covers most of the
+above without writing SQL:
+
+```
+blackwall                        full text, ranked
+"night city"                     a phrase
+denzel OR cryer                  either
+NEAR(arasaka tower, 5)           within five words
+speaker:johnny addressee:alt     shape 6, no SQL
+speaker:"maximum mike" radio     a filter narrowing a full-text search
+blackwall kind:shard             either order, anywhere in the box
+```
+
+Full text reaches `title` and `text`. Everything else - `speaker`, `addressee`, `kind`,
+`source`, `scene`, `contact`, `category`, `quest_type`, `address`, `id` - filters, and
+`speaker:`/`addressee:` match on the normalised key, so the case trap in shape 5 cannot
+bite. A filter with no search term reads in authored order rather than by rank.
+
+Anything else is the SQL tab, where `Ctrl`+`Space` completes column names.
+
 ---
 
 ## Traps

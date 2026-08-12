@@ -31,8 +31,17 @@ python explore.py             # query console in the browser, http://127.0.0.1:8
 `explore.py` is a full-text box, a SQL box and a list of saved queries. An `id` in a result
 opens the whole record, a `scene` reads it back in order, a speaker expands to everything
 that character says. The database is opened read-only and the SQL box takes `SELECT`,
-`WITH` and `EXPLAIN` only, so nothing typed there can damage the archive. Standard library
-only - no install step.
+`WITH` and `EXPLAIN` only, so nothing typed there can damage the archive.
+
+The search box takes `field:value` alongside the search terms - `speaker:johnny
+addressee:alt`, `blackwall kind:shard`. Full text covers `title` and `text`; everything
+else filters. `speaker:` and `addressee:` match the normalised key, so case does not
+matter.
+
+The SQL box is CodeMirror, with `Ctrl`+`Space` completing table and column names read from
+the database itself. It lives in `vendor/codemirror/` (MIT, committed) so the console works
+with no network. Python side is standard library only - no install step, and the page falls
+back to a plain text box if the vendor directory is missing.
 
 ```sql
 -- full text, ranked

@@ -21,7 +21,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-DB = Path(__file__).resolve().parent / "data" / "journal.db"
+HERE = Path(__file__).resolve().parent
+DB = HERE / "data" / "journal.db"
+VENDOR = HERE / "vendor" / "codemirror"
+MIMES = {".js": "application/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
 
 ROW_LIMIT = 1000          # rows returned to the browser
 CELL_LIMIT = 4000         # characters per cell before truncation
@@ -196,6 +199,22 @@ def stats() -> dict:
         conn.close()
 
 
+def schema() -> dict:
+    """Table -> column names, for the editor's completion. Read from the database rather
+    than restated here, so a rebuild that adds a column completes without an edit."""
+    conn = connect()
+    try:
+        out = {}
+        for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view') "
+            "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'search!_%' ESCAPE '!'"
+        ):
+            out[name] = [r[1] for r in conn.execute(f"PRAGMA table_info('{name}')")]
+        return out
+    finally:
+        conn.close()
+
+
 PRESETS = [
     ("Read a scene in order",
      "SELECT line, speaker, addressee, text FROM entries\n"
@@ -233,6 +252,8 @@ PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Night City text archive</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/vendor/codemirror.min.css">
+<link rel="stylesheet" href="/vendor/show-hint.min.css">
 <style>
 :root{
   --bg:#0d0f12; --panel:#14181d; --panel2:#191e25; --line:#262d36;
@@ -296,6 +317,26 @@ a.link:hover{color:var(--accent)}
 #side pre{margin:0;padding:14px;font-family:var(--mono);font-size:12px;
   white-space:pre-wrap;overflow-wrap:anywhere;color:#c3ccd6}
 .empty{padding:24px 16px;color:var(--dim)}
+
+/* CodeMirror, dressed to match the page. The library ships a light theme only. */
+.CodeMirror{height:auto;min-height:120px;background:var(--panel2);color:var(--fg);
+  border:1px solid var(--line);font-family:var(--mono);font-size:13px;line-height:1.55}
+.CodeMirror-focused{border-color:var(--accent)}
+.CodeMirror-gutters{background:var(--panel);border-right:1px solid var(--line)}
+.CodeMirror-linenumber{color:#4a5561}
+.CodeMirror-cursor{border-left:2px solid var(--accent)}
+.CodeMirror-selected{background:#2c3542 !important}
+.CodeMirror-matchingbracket{color:var(--accent) !important;border-bottom:1px solid var(--accent)}
+.cm-s-default .cm-keyword{color:#ff7edb;font-weight:600}
+.cm-s-default .cm-string,.cm-s-default .cm-string-2{color:#9ee37d}
+.cm-s-default .cm-number{color:var(--accent2)}
+.cm-s-default .cm-comment{color:#5c6773;font-style:italic}
+.cm-s-default .cm-variable,.cm-s-default .cm-variable-2{color:var(--fg)}
+.cm-s-default .cm-builtin,.cm-s-default .cm-atom{color:var(--accent)}
+.CodeMirror-hints{background:var(--panel);border:1px solid var(--accent);
+  font-family:var(--mono);font-size:12px;z-index:30;box-shadow:0 6px 24px #000a}
+.CodeMirror-hint{color:var(--fg);padding:3px 10px}
+li.CodeMirror-hint-active{background:var(--accent);color:#000;font-weight:600}
 kbd{font-family:var(--mono);font-size:11px;background:var(--panel2);border:1px solid var(--line);
   padding:1px 5px}
 .hidden{display:none}
@@ -330,7 +371,8 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--panel2);border:1px s
     <div class="sqlrow">
       <button class="go" id="goSql">Run</button>
       <select id="preset"><option value="">a query that answers something…</option></select>
-      <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> runs. Read-only: SELECT / WITH only.</span>
+      <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> runs, <kbd>Ctrl</kbd>+<kbd>Space</kbd>
+        completes table and column names. Read-only: SELECT / WITH only.</span>
     </div>
   </div>
 
@@ -344,6 +386,12 @@ kbd{font-family:var(--mono);font-size:11px;background:var(--panel2);border:1px s
 </div>
 </main>
 
+<script src="/vendor/codemirror.min.js"></script>
+<script src="/vendor/sql.min.js"></script>
+<script src="/vendor/show-hint.min.js"></script>
+<script src="/vendor/sql-hint.min.js"></script>
+<script src="/vendor/matchbrackets.min.js"></script>
+<script src="/vendor/closebrackets.min.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -402,10 +450,47 @@ async function doSearch(){
     {term, kind: $('#kind').value, limit: +$('#limit').value}));
 }
 
+// The editor replaces the textarea when the vendored library is present; the textarea is
+// what the page falls back to when it is not.
+let editor = null;
+const getSql = () => editor ? editor.getValue() : $('#sql').value;
+function setSql(text){
+  if (editor){ editor.setValue(text); editor.refresh(); editor.focus();
+               editor.setCursor(editor.lineCount(), 0); }
+  else { $('#sql').value = text; }
+}
+
 async function doSql(sql){
-  if (sql !== undefined) $('#sql').value = sql;
+  if (sql !== undefined) setSql(sql);
   setStatus('running…');
-  render(await post('/api/sql', {sql: $('#sql').value}));
+  render(await post('/api/sql', {sql: getSql()}));
+}
+
+function initEditor(tables){
+  if (typeof CodeMirror === 'undefined') return;
+  editor = CodeMirror.fromTextArea($('#sql'), {
+    mode: 'text/x-sqlite',
+    lineNumbers: true,
+    matchBrackets: true,
+    autoCloseBrackets: true,
+    viewportMargin: Infinity,
+    extraKeys: {
+      'Ctrl-Enter': () => doSql(),
+      'Cmd-Enter': () => doSql(),
+      'Ctrl-Space': 'autocomplete',
+      'Tab': cm => cm.replaceSelection('  ')
+    },
+    hintOptions: {tables, completeSingle: false}
+  });
+  // completing as you type: only on a word, never inside a string or after a digit
+  editor.on('inputRead', (cm, change) => {
+    if (change.origin !== '+input') return;
+    if (!/[\w.]/.test(change.text[0])) return;
+    const token = cm.getTokenAt(cm.getCursor());
+    if (token.type === 'string' || token.type === 'comment' || token.type === 'number') return;
+    if (token.string.length < 2) return;
+    cm.showHint({completeSingle: false});
+  });
 }
 
 function showSql(sql){
@@ -420,7 +505,9 @@ function tab(which){
   $('#searchBar').classList.toggle('hidden', !searching);
   $('#searchHint').classList.toggle('hidden', !searching);
   $('#sqlBar').classList.toggle('hidden', searching);
-  $(searching ? '#q' : '#sql').focus();
+  if (searching) $('#q').focus();
+  else if (editor){ editor.refresh(); editor.focus(); }
+  else $('#sql').focus();
 }
 $('#tabSearch').onclick = () => tab('search');
 $('#tabSql').onclick = () => tab('sql');
@@ -428,7 +515,7 @@ $('#tabSql').onclick = () => tab('sql');
 $('#goSearch').onclick = () => doSearch();
 $('#q').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 $('#goSql').onclick = () => doSql();
-$('#sql').addEventListener('keydown', e => {
+$('#sql').addEventListener('keydown', e => {   // the fallback textarea; the editor keymaps its own
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)){ e.preventDefault(); doSql(); }
 });
 $('#preset').onchange = e => { if (e.target.value) showSql(e.target.value); e.target.selectedIndex = 0; };
@@ -462,6 +549,7 @@ $('#fieldList').addEventListener('click', e => {
 });
 
 (async () => {
+  initEditor(await (await fetch('/api/schema')).json());
   const f = await (await fetch('/api/fields')).json();
   $('#fieldList').innerHTML = f.map(x => `<span class="chip">${x}:</span>`).join('');
   const s = await (await fetch('/api/stats')).json();
@@ -507,8 +595,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(PRESETS)
         elif path == "/api/fields":
             self.send_json(sorted(f for f in FIELDS if not f.endswith("_key")))
+        elif path == "/api/schema":
+            self.send_json(schema())
+        elif path.startswith("/vendor/"):
+            self.send_asset(path[len("/vendor/"):])
         else:
             self.send_json({"error": "no such path"}, 404)
+
+    def send_asset(self, name: str):
+        """Serve one vendored editor file. The name is matched against the directory
+        listing rather than joined onto it, so a path cannot walk out of vendor/."""
+        target = next((p for p in VENDOR.glob("*") if p.name == name and p.is_file()), None)
+        if target is None:
+            return self.send_json({"error": f"no vendored asset {name}"}, 404)
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", MIMES.get(target.suffix, "text/plain"))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         path = urlparse(self.path).path

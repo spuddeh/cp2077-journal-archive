@@ -520,6 +520,15 @@ def pick_speaker(candidates, scene):
     return dict(pool[0], ambiguous=True)
 
 
+def is_corrupt(text):
+    """True when a payload is not text.
+
+    Some embedded scene payloads ship as a run of NUL bytes, or as a fragment still carrying
+    another locale's tag with its first byte overwritten. The corruption is in the shipped file.
+    """
+    return bool(text) and chr(0) in text
+
+
 def build_subtitles(path, speakers=None):
     """One record per line, not per scene.
 
@@ -528,7 +537,11 @@ def build_subtitles(path, speakers=None):
     """
     speakers = speakers or {}
     records = []
+    corrupt = []
     prefix = re.compile(r"^(base|ep1)\\localization\\en-us\\subtitles\\", re.IGNORECASE)
+    # A scene carrying its own text has no resource under the subtitles tree, so its rows arrive
+    # keyed by the .scene path instead.
+    scene_prefix = re.compile(r"^(base|ep1)\\", re.IGNORECASE)
     per_scene = {}
     with open(path, encoding="utf-8") as f:
         for raw_line in f:
@@ -538,10 +551,16 @@ def build_subtitles(path, speakers=None):
             row = json.loads(raw_line)
             game_path = row["p"]
             source = game_path.split("\\", 1)[0].lower()
-            scene = prefix.sub("", game_path).removesuffix(".json").replace("\\", "/")
+            if game_path.lower().endswith(".scene"):
+                scene = scene_prefix.sub("", game_path).removesuffix(".scene").replace("\\", "/")
+            else:
+                scene = prefix.sub("", game_path).removesuffix(".json").replace("\\", "/")
             index = per_scene.get(scene, 0)
             per_scene[scene] = index + 1
 
+            if is_corrupt(row.get("f")) or is_corrupt(row.get("m")):
+                corrupt.append(row)
+                continue
             text, spoken = render_line(row.get("f"))
             male, _ = render_line(row.get("m"))
             if not text and not male:
@@ -588,6 +607,9 @@ def build_subtitles(path, speakers=None):
             if rec.get("addressee"):
                 rec["addressee_key"] = speaker_key(rec["addressee"])
             records.append(rec)
+    if corrupt:
+        print(f"  dropped {len(corrupt):,} payloads the game ships corrupt "
+              f"(see report_corrupt_payloads.py)")
     return records
 
 
@@ -823,6 +845,19 @@ def main():
         print(f"subtitles: {len(lines):,} lines, {attributed:,} with a speaker ({pct:.1f}%)")
     else:
         print(f"subtitles: skipped, no {subs}")
+
+    # Around 1,600 scenes keep their subtitles inside the scene rather than in a resource under
+    # the subtitles tree, and those have no resource at all - sweeping only the resources loses
+    # every line in them.
+    scene_subs = os.path.join(args.raw, "scene_subtitles_en_us.jsonl")
+    if os.path.exists(scene_subs):
+        seen = {r["journal_id"] for r in records if r.get("journal_id")}
+        extra = [r for r in build_subtitles(scene_subs, load_speakers(args.raw))
+                 if r["journal_id"] not in seen]
+        records.extend(extra)
+        print(f"scene-embedded subtitles: {len(extra):,} lines a resource does not carry")
+    else:
+        print(f"scene subtitles: skipped, no {scene_subs}")
 
     by_kind = {}
     for r in records:

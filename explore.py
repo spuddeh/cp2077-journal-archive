@@ -1,652 +1,106 @@
-"""Local query console for data/journal.db.
+"""Local query console for data/journal.db - the same page GitHub Pages publishes.
 
     python explore.py            # serves on http://127.0.0.1:8777 and opens a browser
     python explore.py --port N   # a different port
     python explore.py --no-open  # do not open a browser
 
-The database is opened read-only and the SQL endpoint refuses anything that is not a
-single SELECT, so a typo in the console cannot damage the archive.
+The page runs every query in the browser and reads the database by HTTP range requests,
+so this server hands out files and byte ranges and nothing else. Python's http.server
+ignores Range headers, which sql.js-httpvfs cannot work without, so the handler adds
+single-range support. Standard library only.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import sqlite3
 import sys
-import time
 import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 HERE = Path(__file__).resolve().parent
+SITE = HERE / "site"
 DB = HERE / "data" / "journal.db"
-VENDOR = HERE / "vendor" / "codemirror"
-MIMES = {".js": "application/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
+RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
-ROW_LIMIT = 1000          # rows returned to the browser
-CELL_LIMIT = 4000         # characters per cell before truncation
-QUERY_TIMEOUT = 15.0      # seconds before a query is aborted
-
-# A statement must start with one of these. WITH is allowed because a CTE that ends in a
-# SELECT is still a read - the write forms (INSERT/UPDATE/DELETE after a CTE) are caught by
-# the keyword scan below.
-READ_STARTS = ("select", "with", "explain")
-WRITE_WORDS = (
-    "insert", "update", "delete", "drop", "alter", "create", "replace",
-    "attach", "detach", "pragma", "vacuum", "reindex", "begin", "commit",
-)
+# The published site reads split parts through a generated config; locally the page reads
+# the one database file. requestChunkSize must equal the database page size.
+CONFIG = {"serverMode": "full", "requestChunkSize": 4096, "url": "journal.db"}
 
 
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{DB.as_posix()}?mode=ro", uri=True)
-    conn.text_factory = str
-    return conn
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(SITE), **kwargs)
 
-
-def guard(sql: str) -> str | None:
-    """Return an error message if the statement is not a single read."""
-    stripped = sql.strip().rstrip(";").strip()
-    if not stripped:
-        return "Nothing to run."
-    if ";" in stripped:
-        return "One statement at a time."
-    lowered = stripped.lower()
-    if not lowered.startswith(READ_STARTS):
-        return "Read-only console: statements must start with SELECT, WITH or EXPLAIN."
-    words = set(lowered.replace("(", " ").replace(")", " ").replace(",", " ").split())
-    hit = words & set(WRITE_WORDS)
-    if hit:
-        return f"Read-only console: {sorted(hit)[0].upper()} is not allowed."
-    return None
-
-
-def run(sql: str, params: tuple = ()) -> dict:
-    conn = connect()
-    deadline = time.monotonic() + QUERY_TIMEOUT
-    conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 20000)
-    started = time.monotonic()
-    try:
-        cur = conn.execute(sql, params)
-        cols = [d[0] for d in cur.description] if cur.description else []
-        rows = []
-        for row in cur:
-            rows.append([cell(v) for v in row])
-            if len(rows) >= ROW_LIMIT:
-                break
-        return {
-            "cols": cols,
-            "rows": rows,
-            "ms": round((time.monotonic() - started) * 1000),
-            "truncated": len(rows) >= ROW_LIMIT,
-        }
-    except sqlite3.OperationalError as exc:
-        msg = str(exc)
-        if "interrupted" in msg:
-            msg = f"Query aborted after {QUERY_TIMEOUT:g}s."
-        return {"error": msg}
-    except sqlite3.Error as exc:
-        return {"error": str(exc)}
-    finally:
-        conn.close()
-
-
-def cell(value) -> str:
-    if value is None:
-        return ""
-    text = value if isinstance(value, str) else str(value)
-    if len(text) > CELL_LIMIT:
-        return text[:CELL_LIMIT] + f"… [{len(text)} chars]"
-    return text
-
-
-# `field:value` in the search box filters on a column of `entries`. The full-text index
-# covers title and text only, so without this a filter reaches FTS5 and comes back as
-# "no such column". A key column is matched on its normalised form, which is the only way
-# to catch a name the scenes authored with inconsistent case.
-FIELDS = {
-    "speaker": ("speaker_key", True),
-    "addressee": ("addressee_key", True),
-    "speaker_key": ("speaker_key", True),
-    "addressee_key": ("addressee_key", True),
-    "kind": ("kind", False),
-    "source": ("source", False),
-    "scene": ("scene", False),
-    "contact": ("contact", False),
-    "category": ("category", False),
-    "quest_type": ("quest_type", False),
-    "address": ("address", False),
-    "id": ("id", False),
-}
-
-FILTER_RE = re.compile(r'(\w+)\s*:\s*("[^"]*"|\'[^\']*\'|\S+)')
-
-
-def parse_filters(term: str) -> tuple[str, list[tuple[str, str]]]:
-    """Split `speaker:johnny blackwall` into ('blackwall', [('speaker_key', 'johnny')])."""
-    found: list[tuple[str, str]] = []
-
-    def take(m: re.Match) -> str:
-        field = m.group(1).lower()
-        if field not in FIELDS:
-            return m.group(0)          # an unknown field stays in the full-text term
-        column, normalise = FIELDS[field]
-        value = m.group(2).strip("\"'")
-        if normalise:
-            value = " ".join(value.lower().split())
-        found.append((column, value))
-        return " "
-
-    rest = FILTER_RE.sub(take, term)
-    return " ".join(rest.split()), found
-
-
-def search(term: str, kind: str, limit: int) -> dict:
-    text, filters = parse_filters(term)
-    if kind:
-        filters.append(("kind", kind))
-
-    clauses = [f"e.{column} = ?" for column, _ in filters]
-    params: list = [value for _, value in filters]
-
-    if text:
-        # ranked full text, with any filters narrowing it
-        where = " AND ".join(["search MATCH ?"] + clauses)
-        params = [text] + params + [limit]
-        sql = f"""
-            SELECT e.id, e.kind, e.source, e.title,
-                   snippet(search, 3, '\x02', '\x03', '…', 14) AS match,
-                   e.speaker, e.addressee, e.scene
-            FROM search s JOIN entries e ON e.id = s.id
-            WHERE {where} ORDER BY rank LIMIT ?
-        """
-    elif filters:
-        # filters alone: no text to rank on, so read in authored order
-        params = params + [limit]
-        sql = f"""
-            SELECT e.id, e.kind, e.source, e.title, e.text,
-                   e.speaker, e.addressee, e.scene, e.line
-            FROM entries e
-            WHERE {" AND ".join(clauses)}
-            ORDER BY e.scene, e.line, e.id LIMIT ?
-        """
-    else:
-        return {"cols": [], "rows": [], "ms": 0, "truncated": False}
-
-    result = run(sql, tuple(params))
-    error = result.get("error", "")
-    if error.startswith("no such column"):
-        column = error.split(":")[-1].strip()
-        usable = ", ".join(sorted(f for f in FIELDS if not f.endswith("_key")))
-        result["error"] = (
-            f"'{column}:' is not a filter. Full text covers title: and text: only; "
-            f"the fields that filter are {usable}. Anything else, use the SQL tab."
-        )
-    return result
-
-
-def stats() -> dict:
-    conn = connect()
-    try:
-        kinds = conn.execute(
-            "SELECT kind, count(*) FROM entries GROUP BY kind ORDER BY 2 DESC"
-        ).fetchall()
-        total = sum(c for _, c in kinds)
-        return {"kinds": [{"kind": k, "n": n} for k, n in kinds], "total": total}
-    finally:
-        conn.close()
-
-
-def schema() -> dict:
-    """Table -> column names, for the editor's completion. Read from the database rather
-    than restated here, so a rebuild that adds a column completes without an edit."""
-    conn = connect()
-    try:
-        out = {}
-        for (name,) in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type IN ('table','view') "
-            "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'search!_%' ESCAPE '!'"
-        ):
-            out[name] = [r[1] for r in conn.execute(f"PRAGMA table_info('{name}')")]
-        return out
-    finally:
-        conn.close()
-
-
-PRESETS = [
-    ("Read a scene in order",
-     "SELECT line, speaker, addressee, text FROM entries\n"
-     "WHERE scene = 'quest/q101/q101_07_ripperdoc' ORDER BY line;"),
-    ("Everything one character says",
-     "SELECT scene, line, text FROM entries\n"
-     "WHERE speaker_key = 'judy' ORDER BY scene, line;"),
-    ("One exchange between two characters",
-     "SELECT scene, line, text FROM entries\n"
-     "WHERE speaker_key = 'johnny' AND addressee_key = 'alt' ORDER BY scene, line;"),
-    ("Where the hits cluster",
-     "SELECT scene, count(*) c FROM entries\n"
-     "WHERE speaker_key = 'johnny' AND addressee_key = 'alt'\n"
-     "GROUP BY scene ORDER BY c DESC;"),
-    ("Who talks to whom, most first",
-     "SELECT speaker_key, addressee_key, count(*) c FROM entries\n"
-     "WHERE kind = 'subtitle' AND addressee_key <> ''\n"
-     "GROUP BY 1, 2 ORDER BY c DESC LIMIT 30;"),
-    ("A whole SMS thread with one contact",
-     "SELECT title, text FROM entries WHERE kind = 'sms' AND contact = 'Judy Alvarez';"),
-    ("Busiest speakers",
-     "SELECT speaker_key, count(*) c FROM entries\n"
-     "WHERE kind = 'subtitle' AND speaker_key <> ''\n"
-     "GROUP BY 1 ORDER BY c DESC LIMIT 40;"),
-    ("Lines that differ by V's gender",
-     "SELECT scene, line, text, json_extract(data, '$.text_male') male FROM entries\n"
-     "WHERE json_extract(data, '$.text_male') IS NOT NULL LIMIT 100;"),
-    ("Every LocKey for one entry",
-     "SELECT id, title, json_extract(data, '$.lockeys') FROM entries\n"
-     "WHERE kind = 'shard' AND title LIKE '%Arasaka%';"),
-]
-
-
-PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<title>Night City text archive</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="/vendor/codemirror.min.css">
-<link rel="stylesheet" href="/vendor/show-hint.min.css">
-<style>
-:root{
-  --bg:#0d0f12; --panel:#14181d; --panel2:#191e25; --line:#262d36;
-  --fg:#d8dee6; --dim:#7d8894; --accent:#fcee0a; --accent2:#00e5ff; --bad:#ff5c57;
-  --mono:'Cascadia Mono',Consolas,'DejaVu Sans Mono',monospace;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);
-  font:14px/1.5 'Segoe UI',system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
-header{display:flex;align-items:center;gap:16px;padding:10px 16px;
-  background:var(--panel);border-bottom:1px solid var(--line)}
-header h1{margin:0;font-size:15px;letter-spacing:.14em;text-transform:uppercase;
-  color:var(--accent);font-weight:600}
-header .counts{color:var(--dim);font-size:12px;font-family:var(--mono)}
-.tabs{display:flex;gap:2px;margin-left:auto}
-.tabs button{background:var(--panel2);color:var(--dim);border:1px solid var(--line);
-  padding:5px 14px;cursor:pointer;font:inherit;font-size:13px}
-.tabs button.on{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
-main{flex:1;display:flex;min-height:0}
-#left{flex:1;display:flex;flex-direction:column;min-width:0}
-.bar{display:flex;gap:8px;padding:10px 16px;border-bottom:1px solid var(--line);align-items:center}
-input,select,textarea,button{font:inherit;color:var(--fg);background:var(--panel2);
-  border:1px solid var(--line);padding:7px 10px;outline:none}
-input:focus,textarea:focus{border-color:var(--accent)}
-input[type=search]{flex:1;font-family:var(--mono)}
-button.go{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600;cursor:pointer}
-button.go:hover{background:#fff45a}
-textarea{width:100%;font-family:var(--mono);font-size:13px;resize:vertical;min-height:110px;
-  background:var(--panel2);white-space:pre;tab-size:2}
-.sqlwrap{padding:10px 16px;border-bottom:1px solid var(--line)}
-.sqlrow{display:flex;gap:8px;margin-top:8px;align-items:center}
-.hint{color:var(--dim);font-size:12px}
-#searchHint{padding-top:0;gap:14px;flex-wrap:wrap}
-#searchHint b{color:var(--fg)}
-.chip{font-family:var(--mono);font-size:12px;color:var(--accent2);background:var(--panel2);
-  border:1px solid var(--line);padding:1px 6px;margin-right:4px;cursor:pointer}
-.chip:hover{border-color:var(--accent);color:var(--accent)}
-#status{padding:6px 16px;font-family:var(--mono);font-size:12px;color:var(--dim);
-  border-bottom:1px solid var(--line);min-height:27px}
-#status.err{color:var(--bad)}
-#out{flex:1;overflow:auto;padding:0 0 40px}
-table{border-collapse:collapse;width:100%;font-size:13px}
-th{position:sticky;top:0;background:var(--panel);color:var(--accent2);text-align:left;
-  padding:7px 10px;border-bottom:1px solid var(--line);font-weight:600;
-  font-family:var(--mono);font-size:12px;white-space:nowrap;z-index:2}
-td{padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top;
-  max-width:640px;overflow-wrap:anywhere}
-tbody tr:hover{background:#1b2129}
-td.num{text-align:right;font-family:var(--mono);color:var(--dim);white-space:nowrap}
-td.key{font-family:var(--mono);font-size:12px;color:var(--accent2);white-space:nowrap}
-mark{background:rgba(252,238,10,.22);color:var(--accent);padding:0 1px}
-a.link{color:var(--accent2);cursor:pointer;text-decoration:none;border-bottom:1px dotted}
-a.link:hover{color:var(--accent)}
-#side{width:0;flex:none;background:var(--panel);border-left:1px solid var(--line);
-  overflow:auto;transition:width .12s}
-#side.open{width:min(46vw,720px)}
-#side .head{display:flex;align-items:center;gap:10px;padding:10px 14px;
-  border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
-#side .head b{color:var(--accent);font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
-#side .head button{margin-left:auto;cursor:pointer}
-#side pre{margin:0;padding:14px;font-family:var(--mono);font-size:12px;
-  white-space:pre-wrap;overflow-wrap:anywhere;color:#c3ccd6}
-.empty{padding:24px 16px;color:var(--dim)}
-
-/* CodeMirror, dressed to match the page. The library ships a light theme only. */
-.CodeMirror{height:auto;min-height:120px;background:var(--panel2);color:var(--fg);
-  border:1px solid var(--line);font-family:var(--mono);font-size:13px;line-height:1.55}
-.CodeMirror-focused{border-color:var(--accent)}
-.CodeMirror-gutters{background:var(--panel);border-right:1px solid var(--line)}
-.CodeMirror-linenumber{color:#4a5561}
-.CodeMirror-cursor{border-left:2px solid var(--accent)}
-.CodeMirror-selected{background:#2c3542 !important}
-.CodeMirror-matchingbracket{color:var(--accent) !important;border-bottom:1px solid var(--accent)}
-.cm-s-default .cm-keyword{color:#ff7edb;font-weight:600}
-.cm-s-default .cm-string,.cm-s-default .cm-string-2{color:#9ee37d}
-.cm-s-default .cm-number{color:var(--accent2)}
-.cm-s-default .cm-comment{color:#5c6773;font-style:italic}
-.cm-s-default .cm-variable,.cm-s-default .cm-variable-2{color:var(--fg)}
-.cm-s-default .cm-builtin,.cm-s-default .cm-atom{color:var(--accent)}
-.CodeMirror-hints{background:var(--panel);border:1px solid var(--accent);
-  font-family:var(--mono);font-size:12px;z-index:30;box-shadow:0 6px 24px #000a}
-.CodeMirror-hint{color:var(--fg);padding:3px 10px}
-li.CodeMirror-hint-active{background:var(--accent);color:#000;font-weight:600}
-kbd{font-family:var(--mono);font-size:11px;background:var(--panel2);border:1px solid var(--line);
-  padding:1px 5px}
-.hidden{display:none}
-</style></head><body>
-
-<header>
-  <h1>Night City text archive</h1>
-  <span class="counts" id="counts"></span>
-  <div class="tabs">
-    <button id="tabSearch" class="on">Search</button>
-    <button id="tabSql">SQL</button>
-  </div>
-</header>
-
-<main>
-<div id="left">
-  <div class="bar" id="searchBar">
-    <input type="search" id="q" placeholder="blackwall &nbsp;|&nbsp; &quot;night city&quot; &nbsp;|&nbsp; denzel OR cryer &nbsp;|&nbsp; speaker:johnny addressee:alt &nbsp;|&nbsp; speaker:&quot;maximum mike&quot; radio" autofocus>
-    <select id="kind"><option value="">every kind</option></select>
-    <select id="limit">
-      <option>50</option><option selected>200</option><option>1000</option>
-    </select>
-    <button class="go" id="goSearch">Search</button>
-  </div>
-  <div class="bar hint" id="searchHint">
-    <span><b>field:value</b> filters, bare words are full text, both together narrow one by the other.</span>
-    <span id="fieldList"></span>
-  </div>
-
-  <div class="sqlwrap hidden" id="sqlBar">
-    <textarea id="sql" spellcheck="false">SELECT id, kind, title FROM entries WHERE kind = 'shard' LIMIT 50;</textarea>
-    <div class="sqlrow">
-      <button class="go" id="goSql">Run</button>
-      <select id="preset"><option value="">a query that answers something…</option></select>
-      <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> runs, <kbd>Ctrl</kbd>+<kbd>Space</kbd>
-        completes table and column names. Read-only: SELECT / WITH only.</span>
-    </div>
-  </div>
-
-  <div id="status"></div>
-  <div id="out"><div class="empty">Type a term and hit Search. Click any <b>id</b> for the whole record, any <b>scene</b> to read it in order.</div></div>
-</div>
-
-<div id="side">
-  <div class="head"><b id="sideTitle"></b><button id="sideClose">close</button></div>
-  <pre id="sideBody"></pre>
-</div>
-</main>
-
-<script src="/vendor/codemirror.min.js"></script>
-<script src="/vendor/sql.min.js"></script>
-<script src="/vendor/show-hint.min.js"></script>
-<script src="/vendor/sql-hint.min.js"></script>
-<script src="/vendor/matchbrackets.min.js"></script>
-<script src="/vendor/closebrackets.min.js"></script>
-<script>
-const $ = s => document.querySelector(s);
-const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-let lastCols = [];
-
-async function post(path, body){
-  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
-                              body: JSON.stringify(body)});
-  return r.json();
-}
-
-function setStatus(text, bad){
-  const el = $('#status'); el.textContent = text; el.className = bad ? 'err' : '';
-}
-
-function render(res){
-  if (res.error){ setStatus(res.error, true); $('#out').innerHTML=''; return; }
-  const n = res.rows.length;
-  setStatus(`${n}${res.truncated ? '+ (capped)' : ''} row${n===1?'':'s'} · ${res.ms} ms`);
-  if (!n){ $('#out').innerHTML = '<div class="empty">No rows.</div>'; return; }
-  lastCols = res.cols;
-  const idCol = res.cols.indexOf('id');
-  const sceneCol = res.cols.indexOf('scene');
-  const speakerCol = res.cols.findIndex(c => c === 'speaker_key' || c === 'speaker');
-  let html = '<table><thead><tr>' +
-    res.cols.map(c => `<th>${esc(c)}</th>`).join('') + '</tr></thead><tbody>';
-  for (const row of res.rows){
-    html += '<tr>';
-    row.forEach((v, i) => {
-      let cls = '', cell;
-      if (i === idCol && v){
-        cls = 'key'; cell = `<a class="link" data-entry="${esc(v)}">${esc(v)}</a>`;
-      } else if (i === sceneCol && v){
-        cls = 'key'; cell = `<a class="link" data-scene="${esc(v)}">${esc(v)}</a>`;
-      } else if (i === speakerCol && v){
-        cls = 'key'; cell = `<a class="link" data-speaker="${esc(v)}">${esc(v)}</a>`;
-      } else if (/^-?\d+$/.test(v)){
-        cls = 'num'; cell = esc(v);
-      } else {
-        // \x02 / \x03 are the snippet() markers the server asked for
-        cell = esc(v).split('\u0002').join('<mark>').split('\u0003').join('</mark>');
-      }
-      html += `<td class="${cls}">${cell}</td>`;
-    });
-    html += '</tr>';
-  }
-  $('#out').innerHTML = html + '</tbody></table>';
-  $('#out').scrollTop = 0;
-}
-
-async function doSearch(){
-  const term = $('#q').value.trim();
-  if (!term) return;
-  setStatus('searching…');
-  render(await post('/api/search',
-    {term, kind: $('#kind').value, limit: +$('#limit').value}));
-}
-
-// The editor replaces the textarea when the vendored library is present; the textarea is
-// what the page falls back to when it is not.
-let editor = null;
-const getSql = () => editor ? editor.getValue() : $('#sql').value;
-function setSql(text){
-  if (editor){ editor.setValue(text); editor.refresh(); editor.focus();
-               editor.setCursor(editor.lineCount(), 0); }
-  else { $('#sql').value = text; }
-}
-
-async function doSql(sql){
-  if (sql !== undefined) setSql(sql);
-  setStatus('running…');
-  render(await post('/api/sql', {sql: getSql()}));
-}
-
-function initEditor(tables){
-  if (typeof CodeMirror === 'undefined') return;
-  editor = CodeMirror.fromTextArea($('#sql'), {
-    mode: 'text/x-sqlite',
-    lineNumbers: true,
-    matchBrackets: true,
-    autoCloseBrackets: true,
-    viewportMargin: Infinity,
-    extraKeys: {
-      'Ctrl-Enter': () => doSql(),
-      'Cmd-Enter': () => doSql(),
-      'Ctrl-Space': 'autocomplete',
-      'Tab': cm => cm.replaceSelection('  ')
-    },
-    hintOptions: {tables, completeSingle: false}
-  });
-  // completing as you type: only on a word, never inside a string or after a digit
-  editor.on('inputRead', (cm, change) => {
-    if (change.origin !== '+input') return;
-    if (!/[\w.]/.test(change.text[0])) return;
-    const token = cm.getTokenAt(cm.getCursor());
-    if (token.type === 'string' || token.type === 'comment' || token.type === 'number') return;
-    if (token.string.length < 2) return;
-    cm.showHint({completeSingle: false});
-  });
-}
-
-function showSql(sql){
-  tab('sql');
-  doSql(sql);
-}
-
-function tab(which){
-  const searching = which === 'search';
-  $('#tabSearch').classList.toggle('on', searching);
-  $('#tabSql').classList.toggle('on', !searching);
-  $('#searchBar').classList.toggle('hidden', !searching);
-  $('#searchHint').classList.toggle('hidden', !searching);
-  $('#sqlBar').classList.toggle('hidden', searching);
-  if (searching) $('#q').focus();
-  else if (editor){ editor.refresh(); editor.focus(); }
-  else $('#sql').focus();
-}
-$('#tabSearch').onclick = () => tab('search');
-$('#tabSql').onclick = () => tab('sql');
-
-$('#goSearch').onclick = () => doSearch();
-$('#q').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
-$('#goSql').onclick = () => doSql();
-$('#sql').addEventListener('keydown', e => {   // the fallback textarea; the editor keymaps its own
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)){ e.preventDefault(); doSql(); }
-});
-$('#preset').onchange = e => { if (e.target.value) showSql(e.target.value); e.target.selectedIndex = 0; };
-
-$('#out').addEventListener('click', async e => {
-  const a = e.target.closest('a.link');
-  if (!a) return;
-  if (a.dataset.entry){
-    const res = await post('/api/entry', {id: a.dataset.entry});
-    $('#sideTitle').textContent = a.dataset.entry;
-    $('#sideBody').textContent = res.error || res.data;
-    $('#side').classList.add('open');
-  } else if (a.dataset.scene){
-    showSql(`SELECT line, speaker, addressee, text FROM entries\nWHERE scene = '${a.dataset.scene.replace(/'/g, "''")}' ORDER BY line;`);
-  } else if (a.dataset.speaker){
-    const k = a.dataset.speaker.toLowerCase().replace(/\s+/g, ' ').trim().replace(/'/g, "''");
-    showSql(`SELECT scene, line, addressee, text FROM entries\nWHERE speaker_key = '${k}' ORDER BY scene, line;`);
-  }
-});
-$('#sideClose').onclick = () => $('#side').classList.remove('open');
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') $('#side').classList.remove('open');
-});
-
-$('#fieldList').addEventListener('click', e => {
-  const c = e.target.closest('.chip');
-  if (!c) return;
-  const box = $('#q');
-  box.value = (box.value.trim() + ' ' + c.textContent).trim();
-  box.focus();
-});
-
-(async () => {
-  initEditor(await (await fetch('/api/schema')).json());
-  const f = await (await fetch('/api/fields')).json();
-  $('#fieldList').innerHTML = f.map(x => `<span class="chip">${x}:</span>`).join('');
-  const s = await (await fetch('/api/stats')).json();
-  $('#counts').textContent = s.total.toLocaleString() + ' entries · ' +
-    s.kinds.map(k => `${k.kind} ${k.n.toLocaleString()}`).join('  ');
-  $('#kind').innerHTML = '<option value="">every kind</option>' +
-    s.kinds.map(k => `<option value="${k.kind}">${k.kind}</option>`).join('');
-  const p = await (await fetch('/api/presets')).json();
-  $('#preset').innerHTML = '<option value="">a query that answers something…</option>' +
-    p.map(x => `<option value="${x[1].replace(/"/g,'&quot;')}">${x[0]}</option>`).join('');
-})();
-</script>
-</body></html>
-"""
-
-
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt, *args):  # quiet; the console is the interface
+    def log_message(self, fmt, *args):  # quiet; the page is the interface
         pass
 
-    def send_json(self, obj, code=200):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def translate_path(self, path):
+        if urlparse(path).path == "/data/journal.db":
+            return str(DB)
+        return super().translate_path(path)
 
-    def do_GET(self):
+    def send_head(self):
         path = urlparse(self.path).path
-        if path == "/":
-            body = PAGE.encode("utf-8")
+        if path == "/data/config.json":
+            body = json.dumps(CONFIG).encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif path == "/api/stats":
-            self.send_json(stats())
-        elif path == "/api/presets":
-            self.send_json(PRESETS)
-        elif path == "/api/fields":
-            self.send_json(sorted(f for f in FIELDS if not f.endswith("_key")))
-        elif path == "/api/schema":
-            self.send_json(schema())
-        elif path.startswith("/vendor/"):
-            self.send_asset(path[len("/vendor/"):])
-        else:
-            self.send_json({"error": "no such path"}, 404)
+            return None
 
-    def send_asset(self, name: str):
-        """Serve one vendored editor file. The name is matched against the directory
-        listing rather than joined onto it, so a path cannot walk out of vendor/."""
-        target = next((p for p in VENDOR.glob("*") if p.name == name and p.is_file()), None)
-        if target is None:
-            return self.send_json({"error": f"no vendored asset {name}"}, 404)
-        body = target.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", MIMES.get(target.suffix, "text/plain"))
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "max-age=86400")
+        m = RANGE_RE.match(self.headers.get("Range") or "")
+        if not m or not (m.group(1) or m.group(2)):
+            return super().send_head()
+
+        target = self.translate_path(self.path)
+        if not os.path.isfile(target):
+            self.send_error(404)
+            return None
+        size = os.path.getsize(target)
+        if m.group(1):
+            start = int(m.group(1))
+            end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+        else:                                  # suffix range: the last N bytes
+            start, end = max(0, size - int(m.group(2))), size - 1
+        if start >= size or start > end:
+            self.send_error(416)
+            return None
+
+        fh = open(target, "rb")
+        fh.seek(start)
+        self.send_response(206)
+        self.send_header("Content-Type", self.guess_type(target))
+        self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(end - start + 1))
         self.end_headers()
-        self.wfile.write(body)
+        self._range_length = end - start + 1
+        return fh
 
-    def do_POST(self):
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length") or 0)
-        try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except ValueError:
-            return self.send_json({"error": "bad request body"}, 400)
+    def copyfile(self, source, outputfile):
+        remaining = getattr(self, "_range_length", None)
+        if remaining is None:
+            return super().copyfile(source, outputfile)
+        while remaining > 0:
+            block = source.read(min(65536, remaining))
+            if not block:
+                break
+            outputfile.write(block)
+            remaining -= len(block)
+        self._range_length = None
 
-        if path == "/api/search":
-            term = (payload.get("term") or "").strip()
-            limit = min(int(payload.get("limit") or 200), ROW_LIMIT)
-            self.send_json(search(term, payload.get("kind") or "", limit))
-        elif path == "/api/sql":
-            sql = payload.get("sql") or ""
-            problem = guard(sql)
-            self.send_json({"error": problem} if problem else run(sql.strip().rstrip(";")))
-        elif path == "/api/entry":
-            res = run("SELECT data FROM entries WHERE id = ?", (payload.get("id") or "",))
-            if res.get("error"):
-                self.send_json(res)
-            elif not res["rows"]:
-                self.send_json({"error": "no such id"})
-            else:
-                try:
-                    pretty = json.dumps(json.loads(res["rows"][0][0]),
-                                        ensure_ascii=False, indent=2)
-                except ValueError:
-                    pretty = res["rows"][0][0]
-                self.send_json({"data": pretty})
-        else:
-            self.send_json({"error": "no such path"}, 404)
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-cache")
+        # On every response: the library probes with a plain GET and falls back to reading
+        # the whole file when this header is missing.
+        self.send_header("Accept-Ranges", "bytes")
+        super().end_headers()
 
 
 def main() -> int:

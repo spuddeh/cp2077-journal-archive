@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Night City text archive</title>
+<link rel="stylesheet" href="vendor/codemirror/codemirror.min.css">
+<link rel="stylesheet" href="vendor/codemirror/show-hint.min.css">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230d0f12'/%3E%3Crect x='2' y='2' width='12' height='12' fill='none' stroke='%23fcee0a' stroke-width='2'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<header>
+  <h1>Night City <span class="accent">text archive</span></h1>
+  <span class="counts" id="counts">connecting to the database&hellip;</span>
+  <span class="stats" id="stats"></span>
+  <nav class="tabs">
+    <button data-tab="search" class="on">Search</button>
+    <button data-tab="sql">SQL</button>
+    <button data-tab="about">About</button>
+  </nav>
+</header>
+
+<main>
+<div id="left">
+  <div id="pane-search" class="pane">
+    <div class="bar">
+      <input type="search" id="q" autocomplete="off" autofocus
+             placeholder="blackwall &nbsp;|&nbsp; &quot;night city&quot; &nbsp;|&nbsp; denzel OR cryer &nbsp;|&nbsp; speaker:johnny addressee:alt">
+      <select id="kind"><option value="">every kind</option></select>
+      <select id="limit">
+        <option>50</option><option selected>200</option><option>1000</option>
+      </select>
+      <button class="go" id="goSearch">Search</button>
+    </div>
+    <div class="bar hint" id="searchHint">
+      <span><b>field:value</b> filters, bare words are full text, both together narrow one by the other.</span>
+      <span id="fieldList"></span>
+    </div>
+  </div>
+
+  <div id="pane-sql" class="pane hidden">
+    <div class="sqlwrap">
+      <textarea id="sql" spellcheck="false">SELECT id, kind, title FROM entries WHERE kind = 'shard' LIMIT 50</textarea>
+      <div class="sqlrow">
+        <button class="go" id="goSql">Run</button>
+        <select id="preset"><option value="">a query that answers something&hellip;</option></select>
+        <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> runs, <kbd>Ctrl</kbd>+<kbd>Space</kbd>
+          completes table and column names. SELECT, WITH and EXPLAIN only; a LIMIT is added when missing.</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="pane-about" class="pane hidden">
+    <div class="prose">
+      <h2>What this is</h2>
+      <p>Every word of text in Cyberpunk 2077 as a queryable database: shards, phone
+      conversations, codex entries, computer mail and files, the in-game internet, the quest
+      log, the tarot readings, and all 104,895 lines of spoken dialogue with who says each one
+      and to whom. English, base game and Phantom Liberty.</p>
+      <p>Each entry keeps the LocKeys its strings came from, which is what a mod needs to
+      reference or override a line.</p>
+
+      <h2>Using it</h2>
+      <p>The search box is full text over titles and text. <code>field:value</code> narrows it
+      - <code>speaker:johnny addressee:alt</code>, <code>blackwall kind:shard</code> - and a
+      filter with no search words lists matching lines in scene order. Quote a phrase
+      (<code>"night city"</code>), combine with <code>OR</code>, and quote any word holding
+      punctuation.</p>
+      <p>An <b>id</b> in a result opens the whole record, a <b>scene</b> reads it back in
+      order, and a <b>speaker</b> lists everything that character says. The address bar keeps
+      the search, the query and the open record, so a link reproduces what is on screen.</p>
+      <p>The SQL tab reads the same database directly. <code>entries</code> holds one row per
+      entry, with its full record as JSON in <code>data</code>; <code>search</code> is the
+      FTS5 index over <code>title</code> and <code>text</code>. The
+      <a href="https://github.com/spuddeh/cp2077-journal-archive/blob/main/USAGE.md">query
+      cookbook</a> has the shapes that answer real questions, and the traps that make a wrong
+      answer look like a right one.</p>
+      <p>The page queries a SQLite database over HTTP range requests, so only the parts a
+      query touches are downloaded; the counter in the header shows how much. A query that
+      has to read every row downloads most of the database, and a query that an index
+      answers costs a few hundred kilobytes.</p>
+
+      <h2>Where it comes from</h2>
+      <p>The text is read from the game's journal resource, subtitle resources and scene
+      files, and resolved against the English string tables. The extraction scripts and the
+      archive as JSONL are in
+      <a href="https://github.com/spuddeh/cp2077-journal-archive">the repository</a> this
+      site is published from.</p>
+
+      <h2>Whose it is</h2>
+      <p>The text is Cyberpunk 2077's and belongs to CD PROJEKT RED. This is an extraction for
+      modding and research under the
+      <a href="https://www.cdprojektred.com/en/fan-content">CD PROJEKT RED fan content
+      guidelines</a>: non-commercial, text only, no game code, assets or binaries. This is an
+      unofficial fan work and is not approved/endorsed by CD PROJEKT RED.</p>
+    </div>
+  </div>
+
+  <div id="status"></div>
+  <div id="out"><div class="empty">Type a term and hit Search. Click any <b>id</b> for the whole record, any <b>scene</b> to read it in order.</div></div>
+</div>
+
+<aside id="side">
+  <div class="head"><b id="sideTitle"></b><button id="sideClose">close</button></div>
+  <div id="sideBody"></div>
+</aside>
+</main>
+
+<script src="vendor/codemirror/codemirror.min.js"></script>
+<script src="vendor/codemirror/sql.min.js"></script>
+<script src="vendor/codemirror/show-hint.min.js"></script>
+<script src="vendor/codemirror/sql-hint.min.js"></script>
+<script src="vendor/codemirror/matchbrackets.min.js"></script>
+<script src="vendor/codemirror/closebrackets.min.js"></script>
+<script src="vendor/sqljs-httpvfs/index.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

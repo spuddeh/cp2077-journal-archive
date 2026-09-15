@@ -7,9 +7,12 @@ JSONL plus a SQLite database with a full-text index.
 
 Built for querying, not for browsing. One `SELECT` replaces reading thousands of files.
 
+**Query it in the browser: https://spuddeh.github.io/cp2077-journal-archive/** - full-text
+search, SQL with saved queries, and every record, with nothing to install.
+
 | Kind | Entries | What it is |
 | --- | --- | --- |
-| `subtitle` | 104,895 | Spoken dialogue, one record per line |
+| `subtitle` | 105,367 | Spoken dialogue, one record per line |
 | `shard` | 1,804 | Shards and journal entries the player picks up |
 | `mail` | 733 | Emails on computers and terminals |
 | `internet` | 678 | Pages of the in-game internet |
@@ -28,10 +31,11 @@ python build.py --db-only     # data/journal.db, about two seconds
 python explore.py             # query console in the browser, http://127.0.0.1:8777
 ```
 
-`explore.py` is a full-text box, a SQL box and a list of saved queries. An `id` in a result
-opens the whole record, a `scene` reads it back in order, a speaker expands to everything
-that character says. The database is opened read-only and the SQL box takes `SELECT`,
-`WITH` and `EXPLAIN` only, so nothing typed there can damage the archive.
+`explore.py` serves the same page the website publishes, reading the local database: a
+full-text box, a SQL box and a list of saved queries. An `id` in a result opens the whole
+record, a `scene` reads it back in order, a speaker expands to everything that character
+says. The address bar holds the search, the query and the open record, so a link
+reproduces a view.
 
 The search box takes `field:value` alongside the search terms - `speaker:johnny
 addressee:alt`, `blackwall kind:shard`. Full text covers `title` and `text`; everything
@@ -39,9 +43,15 @@ else filters. `speaker:` and `addressee:` match the normalised key, so case does
 matter.
 
 The SQL box is CodeMirror, with `Ctrl`+`Space` completing table and column names read from
-the database itself. It lives in `vendor/codemirror/` (MIT, committed) so the console works
-with no network. Python side is standard library only - no install step, and the page falls
-back to a plain text box if the vendor directory is missing.
+the database itself. It takes `SELECT`, `WITH` and `EXPLAIN`, and adds a `LIMIT` when a
+query has none.
+
+Every query runs in the browser, in [sql.js-httpvfs](https://github.com/phiresky/sql.js-httpvfs),
+which reads the database by HTTP range requests and downloads only the pages a query
+touches. A 200-result search costs a few megabytes; a query no index answers downloads the
+rows it reads, and the header counts the bytes. The libraries are vendored under
+`site/vendor/` (CodeMirror MIT, sql.js-httpvfs Apache-2.0), so the local console needs no
+network. Python side is standard library only.
 
 ```sql
 -- full text, ranked
@@ -59,7 +69,9 @@ SELECT data FROM entries WHERE id = 'codex/glossary/world/blackwall';
 ```
 
 `entries.data` holds the complete record; the other columns are there so a query can
-filter without parsing JSON. The `search` table indexes `title` and `text` only.
+filter without parsing JSON. The `search` table indexes `title` and `text` only. It is an
+external-content FTS5 table over `entries` with the same `rowid`, so the cheap join from a
+match to its row is `JOIN entries e ON e.rowid = s.rowid`. `kinds` holds the count per kind.
 
 The JSONL files carry the same records, one per line, if a stream is easier than a query.
 
@@ -108,7 +120,7 @@ own.
 A subtitle resource names no speaker. A `.scene` does: every `scnscreenplayDialogLine`
 carries the subtitle's own id in `locstringId.ruid`, alongside `speaker` and `addressee`
 actor ids that resolve against that scene's `actors` list. Sweeping all 8,553 scenes
-attributes **104,798 of 104,895 lines**, and gives who each line is aimed at for free.
+attributes **105,270 of 105,367 lines**, and gives who each line is aimed at for free.
 
 ```sql
 -- everything one character says
@@ -203,12 +215,28 @@ Python 3.9 or newer, standard library only. `data/journal.db` is not committed -
 rebuilt from the committed JSONL in about two seconds, and `raw/` is not committed either
 because it is 118 MB that derives entirely from a game install.
 
+## The website
+
+`site/` is a static page. `.github/workflows/pages.yml` builds the database from the
+committed JSONL on every push that changes the data, the build or the site, splits it into
+50 MB parts with `scripts/split_db.py` (GitHub rejects files over 100 MB), and deploys it
+to GitHub Pages. The parts go in a folder named by the database's content hash, because a
+browser caches range responses per URL and parts of two builds under one URL read as a
+malformed database.
+
+`scripts/cdp_probe.py` drives the page in headless Chrome over the DevTools protocol, for
+checking a query's cost and result without a person at the browser. It needs
+`pip install websocket-client`.
+
 ## What this contains, and whose it is
 
 The text is Cyberpunk 2077's, so it belongs to CD PROJEKT RED. This repository is an
 extraction of it for modding and research - finding a LocKey, checking whether a thing is
 in the lore, reading a scene in order - and it carries no game code, assets or binaries.
-The build and query scripts are the only part that is this repository's own work.
+The build and query scripts, the website and the database schema are the only part that is
+this repository's own work, and they are [MIT licensed](LICENSE). This is an unofficial fan
+work under the CD PROJEKT RED [fan content guidelines](https://www.cdprojektred.com/en/fan-content),
+non-commercial, and is not approved/endorsed by CD PROJEKT RED.
 
 This archive was built with the assistance of an LLM. Every count in this README was run
 against the database rather than estimated. No rogue AIs were permitted through the

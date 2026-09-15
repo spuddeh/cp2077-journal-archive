@@ -3,7 +3,7 @@
 The shapes that answer real questions against `data/journal.db`. Each one is here because it
 came up, not because it completes a matrix.
 
-Run them however is convenient. `python explore.py` puts them in a browser - the SQL box takes
+Run them however is convenient. The [website](https://spuddeh.github.io/cp2077-journal-archive/) and `python explore.py` put them in a browser - the SQL box takes
 any of these, and the saved-query list carries the ones below. Or from a shell:
 
 ```bash
@@ -20,7 +20,7 @@ exactly like corrupt data.
 
 ```sql
 SELECT e.id, e.kind, e.title
-FROM search s JOIN entries e ON e.id = s.id
+FROM search s JOIN entries e ON e.rowid = s.rowid
 WHERE search MATCH 'blackwall'
 ORDER BY rank LIMIT 20;
 ```

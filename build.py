@@ -663,7 +663,8 @@ def write_sqlite(records, path):
     db = sqlite3.connect(path)
     db.executescript("""
         CREATE TABLE entries (
-            id            TEXT PRIMARY KEY,
+            rowid         INTEGER PRIMARY KEY,
+            id            TEXT NOT NULL UNIQUE,
             kind          TEXT NOT NULL,
             source        TEXT NOT NULL,
             journal_id    TEXT,
@@ -682,30 +683,37 @@ def write_sqlite(records, path):
             addressee_key TEXT,
             data          TEXT NOT NULL
         );
-        CREATE INDEX idx_kind    ON entries(kind);
+        -- The website reads this database over HTTP, where a query that touches table rows
+        -- downloads them. These indexes carry the columns their queries sort and group on, so
+        -- the site's searches and saved queries answer from the index.
+        CREATE INDEX idx_kind    ON entries(kind, speaker_key, addressee_key);
         CREATE INDEX idx_contact ON entries(contact);
         CREATE INDEX idx_cat     ON entries(category);
         CREATE INDEX idx_scene   ON entries(scene, line);
-        CREATE INDEX idx_speaker ON entries(speaker_key);
-        CREATE INDEX idx_addr    ON entries(addressee_key);
+        CREATE INDEX idx_speaker ON entries(speaker_key, scene, line);
+        CREATE INDEX idx_addr    ON entries(addressee_key, scene, line);
+        CREATE INDEX idx_male    ON entries(scene, line) WHERE json_extract(data, '$.text_male') IS NOT NULL;
+        -- External content: title and text are read from entries by rowid, not stored twice.
         CREATE VIRTUAL TABLE search USING fts5(
             id UNINDEXED, kind UNINDEXED, title, text,
+            content = 'entries', content_rowid = 'rowid',
             tokenize = "unicode61 remove_diacritics 2"
         );
+        CREATE TABLE kinds (kind TEXT PRIMARY KEY, n INTEGER NOT NULL);
     """)
-    rows, search_rows = [], []
-    for r in records:
+    rows = []
+    for n, r in enumerate(records, 1):
         rows.append((
-            r["id"], r["kind"], r["source"], r.get("journal_id", ""),
+            n, r["id"], r["kind"], r["source"], r.get("journal_id", ""),
             "/".join(r.get("path") or []), r.get("title", ""), r.get("text", ""),
             r.get("contact", ""), r.get("category", ""), r.get("quest_type", ""),
             r.get("address", ""), r.get("scene", ""), r.get("line"),
             r.get("speaker", ""), r.get("speaker_key", ""), r.get("addressee", ""), r.get("addressee_key", ""),
             json.dumps(r, ensure_ascii=False),
         ))
-        search_rows.append((r["id"], r["kind"], r.get("title", ""), r.get("text", "")))
-    db.executemany("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-    db.executemany("INSERT INTO search VALUES (?,?,?,?)", search_rows)
+    db.executemany("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    db.execute("INSERT INTO search(search) VALUES ('rebuild')")
+    db.execute("INSERT INTO kinds SELECT kind, count(*) FROM entries GROUP BY kind")
     db.commit()
     db.execute("VACUUM")
     db.close()

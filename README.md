@@ -22,7 +22,7 @@ search, SQL with saved queries, and every record, with nothing to install.
 | `file` | 333 | Non-email files on computers and terminals |
 | `tarot` | 40 | Tarot card readings |
 
-Base game and Phantom Liberty, tagged per entry by `source`.
+Base game and Phantom Liberty, tagged per entry by `source`. What each game version changed is in [CHANGES.md](CHANGES.md).
 
 ## Using it
 

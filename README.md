@@ -12,15 +12,15 @@ search, SQL with saved queries, and every record, with nothing to install.
 
 | Kind | Entries | What it is |
 | --- | --- | --- |
-| `subtitle` | 105,367 | Spoken dialogue, one record per line |
-| `shard` | 1,804 | Shards and journal entries the player picks up |
-| `mail` | 733 | Emails on computers and terminals |
+| `subtitle` | 107,104 | Spoken dialogue, one record per line |
+| `shard` | 1,837 | Shards and journal entries the player picks up |
+| `mail` | 736 | Emails on computers and terminals |
 | `internet` | 678 | Pages of the in-game internet |
-| `sms` | 556 | Phone conversations, threaded, both speakers |
-| `codex` | 486 | Database and lore entries, with their descriptions |
-| `quest` | 393 | Quest log: description, phases, objectives |
-| `file` | 328 | Non-email files on computers and terminals |
-| `tarot` | 28 | Tarot card readings |
+| `sms` | 575 | Phone conversations, threaded, both speakers |
+| `codex` | 498 | Database and lore entries, with their descriptions |
+| `quest` | 396 | Quest log: description, phases, objectives |
+| `file` | 333 | Non-email files on computers and terminals |
+| `tarot` | 40 | Tarot card readings |
 
 Base game and Phantom Liberty, tagged per entry by `source`.
 
@@ -119,8 +119,8 @@ own.
 
 A subtitle resource names no speaker. A `.scene` does: every `scnscreenplayDialogLine`
 carries the subtitle's own id in `locstringId.ruid`, alongside `speaker` and `addressee`
-actor ids that resolve against that scene's `actors` list. Sweeping all 8,553 scenes
-attributes **105,270 of 105,367 lines**, and gives who each line is aimed at for free.
+actor ids that resolve against that scene's `actors` list. Sweeping all 8,612 scenes
+attributes **107,007 of 107,104 lines**, and gives who each line is aimed at for free.
 
 ```sql
 -- everything one character says
@@ -172,13 +172,13 @@ All four go through `convert_to_json` - the localization files are cooked CR2W d
 the `.json` extension, so extracting them raw yields binary.
 
 Spoken dialogue is a fifth input, `raw/subtitles_en_us.jsonl`, and it is not four files but
-3,800 - one subtitle resource per scene. Sweeping them one call at a time is not viable, so
+3,841 - one subtitle resource per scene. Sweeping them one call at a time is not viable, so
 `sweep_subtitles.wscript` does the whole set inside WolvenKit in about eight seconds. Run it
 through the MCP's `run_wscript` and copy its output into `raw/`. The build skips subtitles
 and says so if that file is absent.
 
 Speakers are a sixth input, `raw/speakers*.jsonl`, from `sweep_speakers.wscript` over the
-8,553 `.scene` files. That is roughly 24 GB of JSON to parse, so the script runs in batches -
+8,612 `.scene` files. That is roughly 24 GB of JSON to parse, so the script runs in batches -
 `base\quest\`, `base\open_world\`, then everything else - about four minutes in total. The
 build merges every `speakers*.jsonl` in `raw/`, and attributes nothing if none are present.
 
@@ -186,7 +186,7 @@ build merges every `speakers*.jsonl` in `raw/`, and attributes nothing if none a
 python build.py               # full rebuild
 ```
 
-Re-run it after a game patch. The counts above come from game version 2310.
+Re-run it after a game patch. The counts above come from game version 2.5.
 
 ## Relation to the Nexus archive
 
